@@ -2,3 +2,4 @@ input/
 work/
 .nextflow/
 .nextflow*
+old_data
