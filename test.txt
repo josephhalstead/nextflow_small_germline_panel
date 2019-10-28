@@ -1,0 +1,13 @@
+process call_variants_platypus{
+    input:
+        file (bam) from inital_bam_channel.collect()
+    output:
+        file ("test.vcf") into inital_vcf
+
+    """
+    echo ${bam.collect { "-V $it " }.join()} > test.vcf  
+    """
+
+
+
+}

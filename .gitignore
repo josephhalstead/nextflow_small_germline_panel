@@ -1,0 +1,4 @@
+input/
+work/
+.nextflow/
+.nextflow*
