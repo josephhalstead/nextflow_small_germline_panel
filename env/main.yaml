@@ -1,0 +1,15 @@
+name: nipd
+channels:
+- bioconda
+dependencies:
+- python = 3.6
+- bwa = 0.7.17
+- bedops = 2.4.35 
+- fastp = 0.20.0
+- samtools = 1.9
+- picard = 2.18.17
+- bcftools = 1.9
+- ensembl-vep = 94.5
+- vt = 0.57721
+- pip:
+  - pyvariantfilter == 0.0.1

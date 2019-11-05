@@ -1,5 +1,23 @@
+#!/usr/bin/env nextflow
 
-params.samples = 'input/*_R{1,2}_001.fastq.gz'
+/*
+========================================================================================
+Nextflow pipeline for germline variant calling
+========================================================================================
+
+Author: Joseph Halstead
+
+*/
+
+
+/*
+========================================================================================
+Set up Parameters
+========================================================================================
+*/
+
+params.samples = 'input/*/*_R{1,2}_001.fastq.gz'
+params.fastp_threads = 1
 params.bwa_threads = 1
 params.reference_genome =  '/media/joseph/Storage/genomic_resources/bwa/human_g1k_v37.fasta'
 params.sequence_dict = '/media/joseph/Storage/genomic_resources/bwa/human_g1k_v37.dict'
@@ -7,7 +25,7 @@ params.bwa_temp_dir = '/tmp/'
 params.sequencing_run = 'test'
 params.picard_temp_dir = '/tmp/'
 params.picard_max_ram_records = 3000000
-params.capture_bed = 'config/IlluminaTruSightCancer_ROI_b37.bed'
+params.capture_bed = 'config/AgilentOGTFH_ROI_b37.bed'
 params.platypus_threads = 1
 params.chromosomes = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "X", "Y", "MT"]
 params.gnomad_exomes = '/media/joseph/Storage/genomic_resources/gnomad/gnomad.exomes.r2.0.1.sites.vcf.gz'
@@ -15,7 +33,17 @@ params.gnomad_genomes = '/media/joseph/Storage/genomic_resources/gnomad/gnomad.g
 params.vep_threads = 1
 params.vep_cache = '/media/joseph/Storage/genomic_resources/vep_caches/vep'
 params.sequencing_centre = 'AWMGL'
+params.platypus_min_reads = 5
+params.platypus_hap_score_threshold = 20
+params.platypus_min_var_freq = 0.05
+params.gnomad_max_pop = 0.01
 
+
+/*
+========================================================================================
+Define initial files
+========================================================================================
+*/
 
 reference_genome = file(params.reference_genome)
 capture_bed = file(params.capture_bed)
@@ -24,6 +52,13 @@ gnomad_exomes = file(params.gnomad_exomes)
 gnomad_genomes = file(params.gnomad_genomes)
 vep_cache = file(params.vep_cache)
 
+
+/*
+========================================================================================
+Define initial channels
+========================================================================================
+*/
+
 Channel
   .fromFilePairs(params.samples, flat: true) 
   .set { reads }
@@ -31,6 +66,15 @@ Channel
 chromosomes_ch = Channel
     .from( params.chromosomes)
 
+
+/*
+========================================================================================
+Main pipeline
+========================================================================================
+*/
+
+
+// Trim reads with fastp
 process trim_reads_with_fastp{
 
     input:
@@ -49,11 +93,12 @@ process trim_reads_with_fastp{
     -o ${id}_R1_trimmed.fastq.gz \
     -O ${id}_R2_trimmed.fastq.gz \
     -h ${id}_trimmed.html \
-    -j ${id}_trimmed.json
+    -j ${id}_trimmed.json \
+    -w $params.fastp_threads
 	"""
 }
 
-
+// Align reads with bwa
 process align_reads_with_bwa{
 
     input:
@@ -82,7 +127,10 @@ process align_reads_with_bwa{
 	"""
 }
 
+// Merge bams from same sample (different lanes) and remove duplicates
 process merge_bams_and_remove_duplicates{
+
+        publishDir "results/final_bams/"
 
     input:
     set val(key), file(bams) from inital_bam_channel.map { file ->
@@ -114,6 +162,7 @@ process merge_bams_and_remove_duplicates{
     """
 }
 
+// Ensure capture bed is correctly sorted
 process sort_capture_bed{
 
     input:
@@ -127,6 +176,7 @@ process sort_capture_bed{
     """
 }
 
+// Split capture bed so that we can parallelise variant calling
 process split_bed_by_chromosome{
 
     input:
@@ -138,13 +188,12 @@ process split_bed_by_chromosome{
 
     """
     bedextract ${chr} $sorted_capture_bed > ${chr}.bed
-
     """
 }
 
-
+// Call variants with platypus
 process call_variants_with_platypus{
-    conda 'platypus-variant'
+    conda 'env/platypus.yaml'
 
     input:
     file (bams) from mark_duplicates_bam_channel.collect()
@@ -163,10 +212,14 @@ process call_variants_with_platypus{
     --output=${params.sequencing_run}_${chr.baseName}.vcf \
     --regions=${chr} \
     --nCPU=${params.platypus_threads} \
+    --minReads=${params.platypus_min_reads} \
+    --hapScoreThreshold=${params.platypus_hap_score_threshold} \
+    --minVarFreq=${params.platypus_min_var_freq} \
     --logFileName=${params.sequencing_run}_${chr.baseName}.log
     """
 }
 
+// PLatypus VCF has strange header so add a correct sequence dict
 process fix_platypus_headers{
 
     input:
@@ -186,13 +239,14 @@ process fix_platypus_headers{
     """
 }
 
+// Collect all vcfs from the different chromosomes and edit headers then normalise using vt
 process collect_per_chromosome_vcfs_split_and_normalise{
 
     input:
     file (per_chr_vcfs) from per_chromsome_vcf_sd_channel.collect()
 
     output:
-    file("${params.sequencing_run}_merged_normalised.vcf") into merged_and_normalised_vcf_channel
+    file("${params.sequencing_run}_merged_normalised_roi.vcf") into merged_and_normalised_vcf_channel
 
     """
     bcftools concat ${per_chr_vcfs.collect { "$it " }.join()} | bcftools sort | \
@@ -200,16 +254,25 @@ process collect_per_chromosome_vcfs_split_and_normalise{
     sed 's/##FORMAT=<ID=NR,Number=./##FORMAT=<ID=NR,Number=A/' | \
     sed 's/##FORMAT=<ID=NV,Number=./##FORMAT=<ID=NV,Number=A/' | \
     vt decompose -s - | vt normalize -r $reference_genome - > ${params.sequencing_run}_merged_normalised.vcf
+
+    bgzip ${params.sequencing_run}_merged_normalised.vcf
+    tabix ${params.sequencing_run}_merged_normalised.vcf.gz
+
+    bcftools view -R $capture_bed ${params.sequencing_run}_merged_normalised.vcf.gz > "${params.sequencing_run}_merged_normalised_roi.vcf"
+
     """
 }
 
+// Annotate using VEP
 process annotate_with_vep{
+
+    publishDir "results/annotated_vcf/"
 
     input:
     file(normalised_vcf) from merged_and_normalised_vcf_channel
 
     output:
-    file("${params.sequencing_run}_merged_normalised_annotated.vcf") into annotated_vcf
+    file("${params.sequencing_run}_merged_normalised_roi_annotated.vcf") into annotated_vcf
 
     """
     vep \
@@ -220,7 +283,7 @@ process annotate_with_vep{
     --species homo_sapiens \
     --assembly GRCh37 \
     --input_file $normalised_vcf \
-    --output_file ${params.sequencing_run}_merged_normalised_annotated.vcf \
+    --output_file ${params.sequencing_run}_merged_normalised_roi_annotated.vcf \
     --force_overwrite \
     --cache \
     --dir  $vep_cache \
@@ -237,4 +300,53 @@ process annotate_with_vep{
     --custom ${gnomad_genomes},gnomADg,vcf,exact,0,AF_POPMAX \
     --custom ${gnomad_exomes},gnomADe,vcf,exact,0,AF_POPMAX 
     """
+}
+
+// Duplicate annotated VCF channel as multiple downstream processes need it
+annotated_vcf.into {
+  annotated_vcf_report
+  annotated_vcf_sample_names
+}
+
+// Extract sample names from vcf
+process get_sample_names_from_vcf{
+
+    input:
+    file(annotated_vcf) from annotated_vcf_sample_names
+
+    output:
+    file("${params.sequencing_run}_sample_names.txt") into sample_names_from_vcf
+
+    """
+    bcftools query -l $annotated_vcf > ${params.sequencing_run}_sample_names.txt
+    """
+
+}
+
+// Create a channel with sample names as the values
+// This is used to create a sample report
+sample_names_from_vcf.splitCsv(header:['col1']).map{ row-> tuple(row.col1)}.set { samples_ch }
+
+// Use a custom python script to create csv with variants in
+process create_snp_indel_variant_report{
+
+    publishDir "results/variant_reports/"
+
+    input:
+    file(annotated_vcf) from annotated_vcf_report
+    val sample_names from samples_ch
+
+    output:
+    file("${params.sequencing_run}_${sample_names[0]}_filtered.csv") into variant_report_filtered
+    file("${params.sequencing_run}_${sample_names[0]}_unfiltered.csv") into variant_report_unfiltered
+
+    """
+    create_variant_report.py \
+    --vcf $annotated_vcf \
+    --sample_id ${sample_names[0]} \
+    --worklist_id $params.sequencing_run \
+    --output ${params.sequencing_run}_${sample_names[0]} \
+    --gnomad_max_af $params.gnomad_max_pop
+    """
+
 }
